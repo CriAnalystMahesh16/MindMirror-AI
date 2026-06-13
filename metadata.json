@@ -1,0 +1,6 @@
+{
+  "name": "MindMirror AI",
+  "description": "Understand Your Mind. Improve Your Journey. Helps competitive exam students monitor and improve mental well-being.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
