@@ -3,12 +3,22 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { 
+  validateCheckInInputs, 
+  sanitizeInput, 
+  calculateBurnoutRisk, 
+  calculateConfidenceLevel, 
+  detectStressTriggers 
+} from "./src/utils/analyzerUtils.js";
 
 // Load environment variables
 dotenv.config();
 
 let aiInstance: GoogleGenAI | null = null;
 
+/**
+ * Instantiates generative AI client in a lazy, safe loader.
+ */
 function getGeminiClient(): GoogleGenAI {
   if (!aiInstance) {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -27,55 +37,67 @@ function getGeminiClient(): GoogleGenAI {
   return aiInstance;
 }
 
-async function startServer() {
+// Lightweight in-memory rate limiting map
+const ipRequestCounts = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+const MAX_REQUESTS_PER_MINUTE = 15;
+
+/**
+ * Basic in-memory rate limiter to prevent server request flood attacks.
+ */
+function rateLimiter(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const ip = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "anonymous";
+  const numCurrentTime = Date.now();
+  const userData = ipRequestCounts.get(ip);
+
+  if (!userData || numCurrentTime > userData.resetTime) {
+    ipRequestCounts.set(ip, { count: 1, resetTime: numCurrentTime + RATE_LIMIT_WINDOW_MS });
+    return next();
+  }
+
+  if (userData.count >= MAX_REQUESTS_PER_MINUTE) {
+    res.status(429).json({ error: "Too many mental reflections in a short time. Please take a deep breath and try again in a minute." });
+    return;
+  }
+
+  userData.count += 1;
+  next();
+}
+
+async function startServer(): Promise<void> {
   const app = express();
   const PORT = 3000;
 
-  // JSON body parser
-  app.use(express.json());
+  // Enforce rigid server security headers
+  app.use((req: express.Request, res: express.Response, next: express.NextFunction): void => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("X-XSS-Protection", "1; mode=block");
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    res.setHeader("Content-Security-Policy", "default-src 'self' https:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https:;");
+    next();
+  });
 
-  // AI analysis endpoint
-  app.post("/api/analyze", async (req: express.Request, res: express.Response) => {
+  // Strict JSON body limit allocation to protect buffer allocation against high payloads
+  app.use(express.json({ limit: "15kb" }));
+
+  // AI analysis endpoint with rate limiting active
+  app.post("/api/analyze", rateLimiter, async (req: express.Request, res: express.Response) => {
     try {
       const { journal, mood, studyHours, sleepHours, examType } = req.body;
 
       // --- Security & Input Validation ---
-      if (typeof journal !== "string" || journal.trim() === "") {
-        return res.status(400).json({ error: "Journal entry is required and must be text." });
-      }
-      
-      // Journal length limits
-      if (journal.length > 2000) {
-        return res.status(400).json({ error: "Journal entry exceeds the limit of 2000 characters." });
-      }
-
       const parsedMood = Number(mood);
-      if (isNaN(parsedMood) || parsedMood < 1 || parsedMood > 10) {
-        return res.status(400).json({ error: "Mood score must be a number between 1 and 10." });
-      }
-
       const parsedStudyHours = Number(studyHours);
-      if (isNaN(parsedStudyHours) || parsedStudyHours < 0 || parsedStudyHours > 24) {
-        return res.status(400).json({ error: "Study hours must be a number between 0 and 24." });
-      }
-
       const parsedSleepHours = Number(sleepHours);
-      if (isNaN(parsedSleepHours) || parsedSleepHours < 0 || parsedSleepHours > 24) {
-        return res.status(400).json({ error: "Sleep hours must be a number between 0 and 24." });
+
+      const validationError = validateCheckInInputs(journal, parsedMood, parsedStudyHours, parsedSleepHours);
+      if (validationError) {
+        return res.status(400).json({ error: validationError });
       }
 
-      // Quick sanitization to escape dangerous HTML/JavaScript tags
-      const sanitizeHtml = (str: string): string => {
-        return str
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;")
-          .replace(/'/g, "&#039;");
-      };
-
-      const safeJournal = sanitizeHtml(journal.trim());
-      const safeExamType = typeof examType === "string" ? sanitizeHtml(examType.trim()).substring(0, 50) : "Competitive Exam";
+      const safeJournal = sanitizeInput(journal.trim());
+      const safeExamType = typeof examType === "string" ? sanitizeInput(examType.trim()).substring(0, 50) : "Competitive Exam";
 
       // --- Instantiate Gemini SDK & Run Analysis ---
       const ai = getGeminiClient();
@@ -147,11 +169,32 @@ You must return ONLY a structured JSON reply conforming strictly to the requeste
         throw new Error("No analysis returned from Gemini AI.");
       }
 
-      const analyzedJson = JSON.parse(textOutput.trim());
+      let analyzedJson;
+      try {
+        analyzedJson = JSON.parse(textOutput.trim());
+      } catch (parseErr) {
+        console.error("Malformed AI response parsing error, fallback strategy active:", parseErr);
+        // Fallback rule-based parsing matching the required strict schema
+        analyzedJson = {
+          stressTriggers: detectStressTriggers(safeJournal),
+          emotionalPatterns: [
+            `Active study load (${parsedStudyHours}h study today) indicates extreme concentration focus towards your ${safeExamType} goals.`,
+            `Rest pattern (${parsedSleepHours}h sleep last night) is a critical indicator of emotional and intellectual processing support.`
+          ],
+          burnoutRisk: calculateBurnoutRisk(parsedStudyHours, parsedSleepHours, parsedMood),
+          confidenceLevel: calculateConfidenceLevel(parsedMood, parsedSleepHours),
+          copingStrategies: [
+            "Adopt the 50-10 Pomodoro method (50 minutes of studying, 10 minutes of active deep breathing) to refresh mind energy.",
+            "Establish a non-negotiable screen-free window 30 minutes before sleep to facilitate deep sleep consolidation."
+          ],
+          encouragement: `Your ${parsedStudyHours}-hour focus is a testament to your hard work. Stay persistent, sleep well, and success in the ${safeExamType} will follow.`
+        };
+      }
       return res.json(analyzedJson);
 
-    } catch (error: any) {
-      console.error("Gemini Error:", error);
+    } catch (error: unknown) {
+      const loggerMsg = error instanceof Error ? error.message : "Internal Server Error";
+      console.error("Gemini Router Error:", loggerMsg);
       return res.status(500).json({
         error: "Our MindMirror AI analyzer is temporarily resting. Please verify your internet connection or check your GEMINI_API_KEY settings and try again."
       });
